@@ -74,6 +74,18 @@ Add a regular expression to capture ActiveSupport notifications from the Kafka c
 requires activesupport gem - records will be generated under fluent_kafka_stats.**
 DESC
 
+
+    config_param :rr_partitioning, :string, :default => nil,
+                 :desc => <<-DESC
+Setup round-robin partitioning type.
+Can be 'count' what means record count in threshold or 'size' what means message size in threshold
+DESC
+    config_param :rr_partitioning_threshold, :integer, :default => nil
+    config_param :rr_partitioning_partitions, :string, :default => nil
+    config_param :rr_partitioning_debug, :integer, :default => 0
+    config_param :rr_partitioning_metricdump, :integer, :default => 1000
+
+
     config_section :buffer do
       config_set_default :chunk_keys, ["topic"]
     end
@@ -88,6 +100,12 @@ DESC
       super
 
       @kafka = nil
+
+      @rr_partition_list = []
+      @rr_partition_id = nil
+      @rr_threshold_value = nil
+      @rr_debug_cnt = 0
+      @rr_debug_metric = nil
     end
 
     def refresh_client(raise_error = true)
@@ -230,7 +248,12 @@ DESC
             record = inject_values_to_record(tag, time, record)
             record.delete(@topic_key) if @exclude_topic_key
             partition_key = (@exclude_partition_key ? record.delete(@partition_key_key) : record[@partition_key_key]) || @default_partition_key
-            partition = (@exclude_partition ? record.delete(@partition_key) : record[@partition_key]) || @default_partition
+#            partition = (@exclude_partition ? record.delete(@partition_key) : record[@partition_key]) || @default_partition
+            if @rr_partitioning
+              partition = round_robin_next(record)
+            else
+              partition = (@exclude_partition ? record.delete(@partition_key) : record[@partition_key]) || @default_partition
+            end
             message_key = (@exclude_message_key ? record.delete(@message_key_key) : record[@message_key_key]) || @default_message_key
 
             if mutate_headers
@@ -250,6 +273,7 @@ DESC
             end
           rescue StandardError => e
             log.warn "unexpected error during format record. Skip broken event:", :error => e.to_s, :error_class => e.class.to_s, :time => time, :record => record
+            log.warn_backtrace backtrace=e.backtrace
             next
           end
 
@@ -287,6 +311,71 @@ DESC
       raise e unless ignore
     ensure
       producer.shutdown if producer
+    end
+
+    def round_robin_next(record)
+      begin
+        if @rr_partition_id.nil?
+          if @rr_partitioning_partitions.nil?
+            log.warn "kafka2 :rr_partitioning_partitions is not set!"
+            return -1 # default
+          end
+          @rr_partition_list = []
+          @rr_partitioning_partitions.split(',').each { |spid|
+            @rr_partition_list << spid.to_i
+          }
+          log.warn "kafka2 partitions: #{JSON.dump(@rr_partition_list)}"
+          @rr_debug_metric = {}
+          @rr_partition_list.each { |pid|
+            @rr_debug_metric["p#{pid}"] = 0
+          }
+          log.warn "kafka2 debug metrics: #{JSON.dump(@rr_debug_metric)}"
+          @rr_threshold_value = 0
+          if @rr_partitioning_threshold.nil?
+            if @rr_partitioning=='count'
+              value = 10
+            elsif @rr_partitioning=='size'
+              value = 10000
+            else
+              value = 0
+            end
+            @rr_partitioning_threshold = value
+          end
+          @rr_partition_id = 0
+        end
+        #
+        if @rr_partitioning=='count'
+          value = 1
+        elsif @rr_partitioning=='size'
+          value = JSON.dump(record).length
+        else
+          value = 0
+        end
+        @rr_threshold_value += value
+        while @rr_threshold_value >= @rr_partitioning_threshold do
+          @rr_partition_id += 1
+          @rr_threshold_value -= @rr_partitioning_threshold
+          if @rr_partition_id >= @rr_partition_list.length
+            @rr_partition_id -= @rr_partition_list.length
+          end
+          if @rr_partitioning_debug>1
+            #log.warn "kafka2 switch partition to #{@rr_partition_list[@rr_partition_id]}"
+          end
+        end
+        if @rr_partitioning_debug>0
+          @rr_debug_metric["p#{@rr_partition_list[@rr_partition_id]}"] += 1
+          @rr_debug_cnt += 1
+          if @rr_debug_cnt >= @rr_partitioning_metricdump
+            @rr_debug_cnt = 0
+            log.warn "kafka2 metrics: #{JSON.dump(@rr_debug_metric)}"
+          end
+        end
+        @rr_partition_list[@rr_partition_id]
+      rescue StandardError => e
+        log.warn "Kafka error", :error => e.to_s, :error_class => e.class.to_s, :stack => e.backtrace
+        log.warn_backtrace backtrace=e.backtrace
+        return 0
+      end
     end
   end
 end
