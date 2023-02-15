@@ -31,6 +31,10 @@ class Fluent::KafkaInput < Fluent::Input
   config_param :add_suffix, :string, :default => nil,
                :desc => "tag suffix"
   config_param :add_offset_in_record, :bool, :default => false
+  config_param :tag_source, :enum, :list => [:topic, :record], :default => :topic,
+               :desc => "Source for the fluentd event tag"
+  config_param :record_tag_key, :string, :default => 'tag',
+               :desc => "Tag field when tag_source is 'record'"
 
   config_param :offset_zookeeper, :string, :default => nil
   config_param :offset_zk_root_node, :string, :default => '/fluent-plugin-kafka'
@@ -39,6 +43,8 @@ class Fluent::KafkaInput < Fluent::Input
                :deprecated => "Use 'time_source record' instead."
   config_param :time_source, :enum, :list => [:now, :kafka, :record], :default => :now,
                :desc => "Source for message timestamp."
+  config_param :record_time_key, :string, :default => 'time',
+               :desc => "Time field when time_source is 'record'"
   config_param :get_kafka_client_log, :bool, :default => false
   config_param :time_format, :string, :default => nil,
                :desc => "Time format to be used to parse 'time' field."
@@ -65,6 +71,7 @@ class Fluent::KafkaInput < Fluent::Input
     require 'kafka'
 
     @time_parser = nil
+    @zookeeper = nil
   end
 
   def configure(conf)
@@ -111,7 +118,7 @@ class Fluent::KafkaInput < Fluent::Input
 
     require 'zookeeper' if @offset_zookeeper
 
-    @parser_proc = setup_parser
+    @parser_proc = setup_parser(conf)
 
     @time_source = :record if @use_record_time
 
@@ -124,7 +131,7 @@ class Fluent::KafkaInput < Fluent::Input
     end
   end
 
-  def setup_parser
+  def setup_parser(conf)
     case @format
     when 'json'
       begin
@@ -163,6 +170,14 @@ class Fluent::KafkaInput < Fluent::Input
         add_offset_in_hash(r, te, msg.offset) if @add_offset_in_record
         r
       }
+    else
+      @custom_parser = Fluent::Plugin.new_parser(conf['format'])
+      @custom_parser.configure(conf)
+      Proc.new { |msg|
+        @custom_parser.parse(msg.value) {|_time, record|
+          record
+        }
+      }
     end
   end
 
@@ -183,19 +198,20 @@ class Fluent::KafkaInput < Fluent::Input
 
     logger = @get_kafka_client_log ? log : nil
     if @scram_mechanism != nil && @username != nil && @password != nil
-      @kafka = Kafka.new(seed_brokers: @brokers, client_id: @client_id, logger: logger, ssl_ca_cert: read_ssl_file(@ssl_ca_cert),
+      @kafka = Kafka.new(seed_brokers: @brokers, client_id: @client_id, logger: logger, ssl_ca_cert_file_path: @ssl_ca_cert,
                          ssl_client_cert: read_ssl_file(@ssl_client_cert), ssl_client_cert_key: read_ssl_file(@ssl_client_cert_key),
                          ssl_ca_certs_from_system: @ssl_ca_certs_from_system, sasl_scram_username: @username, sasl_scram_password: @password,
-                         sasl_scram_mechanism: @scram_mechanism, sasl_over_ssl: @sasl_over_ssl)
+                         sasl_scram_mechanism: @scram_mechanism, sasl_over_ssl: @sasl_over_ssl, ssl_verify_hostname: @ssl_verify_hostname)
     elsif @username != nil && @password != nil
-      @kafka = Kafka.new(seed_brokers: @brokers, client_id: @client_id, logger: logger, ssl_ca_cert: read_ssl_file(@ssl_ca_cert),
+      @kafka = Kafka.new(seed_brokers: @brokers, client_id: @client_id, logger: logger, ssl_ca_cert_file_path: @ssl_ca_cert,
                          ssl_client_cert: read_ssl_file(@ssl_client_cert), ssl_client_cert_key: read_ssl_file(@ssl_client_cert_key),
                          ssl_ca_certs_from_system: @ssl_ca_certs_from_system,sasl_plain_username: @username, sasl_plain_password: @password,
-                         sasl_over_ssl: @sasl_over_ssl)
+                         sasl_over_ssl: @sasl_over_ssl, ssl_verify_hostname: @ssl_verify_hostname)
     else
-      @kafka = Kafka.new(seed_brokers: @brokers, client_id: @client_id, logger: logger, ssl_ca_cert: read_ssl_file(@ssl_ca_cert),
+      @kafka = Kafka.new(seed_brokers: @brokers, client_id: @client_id, logger: logger, ssl_ca_cert_file_path: @ssl_ca_cert,
                          ssl_client_cert: read_ssl_file(@ssl_client_cert), ssl_client_cert_key: read_ssl_file(@ssl_client_cert_key),
-                         ssl_ca_certs_from_system: @ssl_ca_certs_from_system, sasl_gssapi_principal: @principal, sasl_gssapi_keytab: @keytab)
+                         ssl_ca_certs_from_system: @ssl_ca_certs_from_system, sasl_gssapi_principal: @principal, sasl_gssapi_keytab: @keytab,
+                         ssl_verify_hostname: @ssl_verify_hostname)
     end
 
     @zookeeper = Zookeeper.new(@offset_zookeeper) if @offset_zookeeper
@@ -213,6 +229,9 @@ class Fluent::KafkaInput < Fluent::Input
         router,
         @kafka_message_key,
         @time_source,
+        @record_time_key,
+        @tag_source,
+        @record_tag_key,
         opt)
     }
     @topic_watchers.each {|tw|
@@ -237,7 +256,7 @@ class Fluent::KafkaInput < Fluent::Input
   end
 
   class TopicWatcher < Coolio::TimerWatcher
-    def initialize(topic_entry, kafka, interval, parser, add_prefix, add_suffix, offset_manager, router, kafka_message_key, time_source, options={})
+    def initialize(topic_entry, kafka, interval, parser, add_prefix, add_suffix, offset_manager, router, kafka_message_key, time_source, record_time_key, tag_source, record_tag_key, options={})
       @topic_entry = topic_entry
       @kafka = kafka
       @callback = method(:consume)
@@ -249,6 +268,9 @@ class Fluent::KafkaInput < Fluent::Input
       @router = router
       @kafka_message_key = kafka_message_key
       @time_source = time_source
+      @record_time_key = record_time_key
+      @tag_source = tag_source
+      @record_tag_key = record_tag_key
 
       @next_offset = @topic_entry.offset
       if @topic_entry.offset == -1 && offset_manager
@@ -273,7 +295,7 @@ class Fluent::KafkaInput < Fluent::Input
     def consume
       offset = @next_offset
       @fetch_args[:offset] = offset
-      messages = @kafka.fetch_messages(@fetch_args)
+      messages = @kafka.fetch_messages(**@fetch_args)
 
       return if messages.size.zero?
 
@@ -285,6 +307,11 @@ class Fluent::KafkaInput < Fluent::Input
       messages.each { |msg|
         begin
           record = @parser.call(msg, @topic_entry)
+          if @tag_source == :record
+            tag = record[@record_tag_key]
+            tag = @add_prefix + "." + tag if @add_prefix
+            tag = tag + "." + @add_suffix if @add_suffix
+          end
           case @time_source
           when :kafka
             record_time = Fluent::EventTime.from_time(msg.create_time)
@@ -292,9 +319,9 @@ class Fluent::KafkaInput < Fluent::Input
             record_time = Fluent::Engine.now
           when :record
             if @time_format
-              record_time = @time_parser.parse(record['time'])
+              record_time = @time_parser.parse(record[@record_time_key])
             else
-              record_time = record['time']
+              record_time = record[@record_time_key]
             end
           else
             $log.fatal "BUG: invalid time_source: #{@time_source}"

@@ -1,4 +1,5 @@
 require 'thread'
+require 'logger'
 require 'fluent/plugin/output'
 require 'fluent/plugin/kafka_plugin_util'
 
@@ -34,6 +35,7 @@ Set brokers directly:
 <broker1_host>:<broker1_port>,<broker2_host>:<broker2_port>,..
 Brokers: you can choose to use either brokers or zookeeper.
 DESC
+    config_param :topic, :string, :default => nil, :desc => "kafka topic. Placeholders are supported"
     config_param :topic_key, :string, :default => 'topic', :desc => "Field for kafka topic"
     config_param :default_topic, :string, :default => nil,
                  :desc => "Default output topic when record doesn't have topic field"
@@ -67,6 +69,8 @@ DESC
                  :desc => <<-DESC
 Set true to remove topic key from data
 DESC
+    config_param :exclude_fields, :array, :default => [], value_type: :string,
+                 :desc => 'Fields to remove from data where the value is a jsonpath to a record value'
     config_param :headers, :hash, default: {}, symbolize_keys: true, value_type: :string,
                  :desc => 'Kafka message headers'
     config_param :headers_from_record, :hash, default: {}, symbolize_keys: true, value_type: :string,
@@ -83,7 +87,14 @@ DESC
 The codec the producer uses to compress messages. Used for compression.codec
 Supported codecs: (gzip|snappy)
 DESC
+    config_param :record_key, :string, :default => nil,
+                 :desc => <<-DESC
+A jsonpath to a record value pointing to the field which will be passed to the formatter and sent as the Kafka message payload.
+If defined, only this field in the record will be sent to Kafka as the message payload.
+DESC
+    config_param :use_event_time, :bool, :default => false, :desc => 'Use fluentd event time for rdkafka timestamp'
     config_param :max_send_limit_bytes, :size, :default => nil
+    config_param :discard_kafka_delivery_failed, :bool, :default => false
     config_param :rdkafka_buffering_max_ms, :integer, :default => nil, :desc => 'Used for queue.buffering.max.ms'
     config_param :rdkafka_buffering_max_messages, :integer, :default => nil, :desc => 'Used for queue.buffering.max.messages'
     config_param :rdkafka_message_max_bytes, :integer, :default => nil, :desc => 'Used for message.max.bytes'
@@ -94,6 +105,7 @@ DESC
 
     config_param :max_enqueue_retries, :integer, :default => 3
     config_param :enqueue_retry_backoff, :integer, :default => 3
+    config_param :max_enqueue_bytes_per_second, :size, :default => nil, :desc => 'The maximum number of enqueueing bytes per second'
 
     config_param :service_name, :string, :default => nil, :desc => 'Used for sasl.kerberos.service.name'
     config_param :ssl_client_cert_key_password, :string, :default => nil, :desc => 'Used for ssl.key.password'
@@ -109,6 +121,59 @@ DESC
     include Fluent::KafkaPluginUtil::SSLSettings
     include Fluent::KafkaPluginUtil::SaslSettings
 
+    class EnqueueRate
+      class LimitExceeded < StandardError
+        attr_reader :next_retry_clock
+        def initialize(next_retry_clock)
+          @next_retry_clock = next_retry_clock
+        end
+      end
+
+      def initialize(limit_bytes_per_second)
+        @mutex = Mutex.new
+        @start_clock = Fluent::Clock.now
+        @bytes_per_second = 0
+        @limit_bytes_per_second = limit_bytes_per_second
+        @commits = {}
+      end
+
+      def raise_if_limit_exceeded(bytes_to_enqueue)
+        return if @limit_bytes_per_second.nil?
+
+        @mutex.synchronize do
+          @commits[Thread.current] = {
+            clock: Fluent::Clock.now,
+            bytesize: bytes_to_enqueue,
+          }
+
+          @bytes_per_second += @commits[Thread.current][:bytesize]
+          duration = @commits[Thread.current][:clock] - @start_clock
+
+          if duration < 1.0
+            if @bytes_per_second > @limit_bytes_per_second
+              raise LimitExceeded.new(@start_clock + 1.0)
+            end
+          else
+            @start_clock = @commits[Thread.current][:clock]
+            @bytes_per_second = @commits[Thread.current][:bytesize]
+          end
+        end
+      end
+
+      def revert
+        return if @limit_bytes_per_second.nil?
+
+        @mutex.synchronize do
+          return unless @commits[Thread.current]
+          return unless @commits[Thread.current][:clock]
+          if @commits[Thread.current][:clock] >= @start_clock
+            @bytes_per_second -= @commits[Thread.current][:bytesize]
+          end
+          @commits[Thread.current] = nil
+        end
+      end
+    end
+
     def initialize
       super
 
@@ -121,14 +186,37 @@ DESC
       @rr_threshold_value = nil
       @rr_debug_cnt = 0
       @rr_debug_metric = nil
+      @enqueue_rate = nil
+      @writing_threads_mutex = Mutex.new
+      @writing_threads = Set.new
     end
 
     def configure(conf)
       super
       log.instance_eval {
-        def add(level, &block)
-          if block
-            self.info(block.call)
+        def add(level, message = nil)
+          if message.nil?
+            if block_given?
+              message = yield
+            else
+              return
+            end
+          end
+
+          # Follow rdkakfa's log level. See also rdkafka-ruby's bindings.rb: https://github.com/appsignal/rdkafka-ruby/blob/e5c7261e3f2637554a5c12b924be297d7dca1328/lib/rdkafka/bindings.rb#L117
+          case level
+          when Logger::FATAL
+            self.fatal(message)
+          when Logger::ERROR
+            self.error(message)
+          when Logger::WARN
+            self.warn(message)
+          when Logger::INFO
+            self.info(message)
+          when Logger::DEBUG
+            self.debug(message)
+          else
+            self.trace(message)
           end
         end
       }
@@ -160,6 +248,15 @@ DESC
       @headers_from_record.each do |key, value|
         @headers_from_record_accessors[key] = record_accessor_create(value)
       end
+
+      @exclude_field_accessors = @exclude_fields.map do |field|
+        record_accessor_create(field)
+      end
+
+      @enqueue_rate = EnqueueRate.new(@max_enqueue_bytes_per_second) unless @max_enqueue_bytes_per_second.nil?
+
+      @record_field_accessor = nil
+      @record_field_accessor = record_accessor_create(@record_key) unless @record_key.nil?
     end
 
     def build_config
@@ -200,6 +297,8 @@ DESC
       config[:"queue.buffering.max.messages"] = @rdkafka_buffering_max_messages if @rdkafka_buffering_max_messages
       config[:"message.max.bytes"] = @rdkafka_message_max_bytes if @rdkafka_message_max_bytes
       config[:"batch.num.messages"] = @rdkafka_message_max_num if @rdkafka_message_max_num
+      config[:"sasl.username"] = @username if @username
+      config[:"sasl.password"] = @password if @password
 
       @rdkafka_options.each { |k, v|
         config[k.to_sym] = v
@@ -223,8 +322,19 @@ DESC
       true
     end
 
+    def wait_writing_threads
+      done = false
+      until done do
+        @writing_threads_mutex.synchronize do
+          done = true if @writing_threads.empty?
+        end
+        sleep(1) unless done
+      end
+    end
+
     def shutdown
       super
+      wait_writing_threads
       shutdown_producers
     end
 
@@ -281,12 +391,15 @@ DESC
     end
 
     def write(chunk)
+      @writing_threads_mutex.synchronize { @writing_threads.add(Thread.current) }
       tag = chunk.metadata.tag
-      topic = (chunk.metadata.variables && chunk.metadata.variables[@topic_key_sym]) || @default_topic || tag
+      topic = if @topic
+                extract_placeholders(@topic, chunk)
+              else
+                (chunk.metadata.variables && chunk.metadata.variables[@topic_key_sym]) || @default_topic || tag
+              end
 
       handlers = []
-      record_buf = nil
-      record_buf_bytes = nil
 
       headers = @headers.clone
 
@@ -307,10 +420,18 @@ DESC
               headers[key] = header_accessor.call(record)
             end
 
+            unless @exclude_fields.empty?
+              @exclude_field_accessors.each do |exclude_field_acessor|
+                exclude_field_acessor.delete(record)
+              end
+            end
+
+            record = @record_field_accessor.call(record) unless @record_field_accessor.nil?
             record_buf = @formatter_proc.call(tag, time, record)
             record_buf_bytes = record_buf.bytesize
             if @max_send_limit_bytes && record_buf_bytes > @max_send_limit_bytes
-              log.warn "record size exceeds max_send_limit_bytes. Skip event:", :time => time, :record => record
+              log.warn "record size exceeds max_send_limit_bytes. Skip event:", :time => time, :record_size => record_buf_bytes
+              log.debug "Skipped event:", :record => record
               next
             end
           rescue StandardError => e
@@ -318,7 +439,7 @@ DESC
             next
           end
 
-          handler = enqueue_with_retry(producer, topic, record_buf, message_key, partition, headers)
+          handler = enqueue_with_retry(producer, topic, record_buf, message_key, partition, headers, time)
           if @rdkafka_delivery_handle_poll_timeout != 0
             handlers << handler
           end
@@ -328,17 +449,29 @@ DESC
         }
       end
     rescue Exception => e
-      log.warn "Send exception occurred: #{e} at #{e.backtrace.first}"
-      # Raise exception to retry sendind messages
-      raise e
+      if @discard_kafka_delivery_failed
+        log.warn "Delivery failed. Discard events:", :error => e.to_s, :error_class => e.class.to_s, :tag => tag
+      else
+        log.warn "Send exception occurred: #{e} at #{e.backtrace.first}"
+        # Raise exception to retry sendind messages
+        raise e
+      end
+    ensure
+      @writing_threads_mutex.synchronize { @writing_threads.delete(Thread.current) }
     end
 
-    def enqueue_with_retry(producer, topic, record_buf, message_key, partition, headers)
+    def enqueue_with_retry(producer, topic, record_buf, message_key, partition, headers, time)
       attempt = 0
       loop do
         begin
-          return producer.produce(topic: topic, payload: record_buf, key: message_key, partition: partition, headers: headers)
+          @enqueue_rate.raise_if_limit_exceeded(record_buf.bytesize) if @enqueue_rate
+          return producer.produce(topic: topic, payload: record_buf, key: message_key, partition: partition, headers: headers, timestamp: @use_event_time ? Time.at(time) : nil)
+        rescue EnqueueRate::LimitExceeded => e
+          @enqueue_rate.revert if @enqueue_rate
+          duration = e.next_retry_clock - Fluent::Clock.now
+          sleep(duration) if duration > 0.0
         rescue Exception => e
+          @enqueue_rate.revert if @enqueue_rate
           if e.respond_to?(:code) && e.code == :queue_full
             if attempt <= @max_enqueue_retries
               log.warn "Failed to enqueue message; attempting retry #{attempt} of #{@max_enqueue_retries} after #{@enqueue_retry_backoff}s"
@@ -353,7 +486,7 @@ DESC
         end
       end
     end
-    
+
     def round_robin_next(record)
       if @rr_partition_id.nil?
         if @rr_partitioning_partitions.nil?

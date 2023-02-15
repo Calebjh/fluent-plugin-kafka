@@ -15,6 +15,7 @@ module Fluent::Plugin
 Set brokers directly:
 <broker1_host>:<broker1_port>,<broker2_host>:<broker2_port>,..
 DESC
+    config_param :topic, :string, :default => nil, :desc => "kafka topic. Placeholders are supported"
     config_param :topic_key, :string, :default => 'topic', :desc => "Field for kafka topic"
     config_param :default_topic, :string, :default => nil,
                  :desc => "Default output topic when record doesn't have topic field"
@@ -23,7 +24,14 @@ DESC
     config_param :partition_key_key, :string, :default => 'partition_key', :desc => "Field for kafka partition key"
     config_param :default_partition_key, :string, :default => nil
     config_param :partition_key, :string, :default => 'partition', :desc => "Field for kafka partition"
+    config_param :partitioner_hash_function, :enum, list: [:crc32, :murmur2], :default => :crc32,
+                 :desc => "Specify kafka patrtitioner hash algorithm"
     config_param :default_partition, :integer, :default => nil
+    config_param :record_key, :string, :default => nil,
+                 :desc => <<-DESC
+A jsonpath to a record value pointing to the field which will be passed to the formatter and sent as the Kafka message payload.
+If defined, only this field in the record will be sent to Kafka as the message payload.
+DESC
     config_param :use_default_for_unknown_topic, :bool, :default => false, :desc => "If true, default_topic is used when topic not found"
     config_param :client_id, :string, :default => 'fluentd'
     config_param :idempotent, :bool, :default => false, :desc => 'Enable idempotent producer'
@@ -36,14 +44,18 @@ DESC
     config_param :exclude_partition, :bool, :default => false,
                  :desc => 'Set true to remove partition from data'
     config_param :exclude_message_key, :bool, :default => false,
-                 :desc => 'Set true to remove partition key from data'
+                 :desc => 'Set true to remove message key from data'
     config_param :exclude_topic_key, :bool, :default => false,
                  :desc => 'Set true to remove topic name key from data'
+    config_param :exclude_fields, :array, :default => [], value_type: :string,
+                 :desc => 'Fields to remove from data where the value is a jsonpath to a record value'
     config_param :use_event_time, :bool, :default => false, :desc => 'Use fluentd event time for kafka create_time'
     config_param :headers, :hash, default: {}, symbolize_keys: true, value_type: :string,
                  :desc => 'Kafka message headers'
     config_param :headers_from_record, :hash, default: {}, symbolize_keys: true, value_type: :string,
                  :desc => 'Kafka message headers where the header value is a jsonpath to a record value'
+    config_param :resolve_seed_brokers, :bool, :default => false,
+                 :desc => "support brokers' hostname with multiple addresses"
 
     config_param :get_kafka_client_log, :bool, :default => false
 
@@ -68,11 +80,13 @@ The codec the producer uses to compress messages.
 Supported codecs depends on ruby-kafka: https://github.com/zendesk/ruby-kafka#compression
 DESC
     config_param :max_send_limit_bytes, :size, :default => nil
+    config_param :discard_kafka_delivery_failed, :bool, :default => false
     config_param :active_support_notification_regex, :string, :default => nil,
                  :desc => <<-DESC
 Add a regular expression to capture ActiveSupport notifications from the Kafka client
 requires activesupport gem - records will be generated under fluent_kafka_stats.**
 DESC
+    config_param :share_producer, :bool, :default => false, :desc => 'share kafka producer between flush threads'
 
 
     config_param :rr_partitioning, :string, :default => nil,
@@ -100,32 +114,40 @@ DESC
       super
 
       @kafka = nil
-
       @rr_partition_list = []
       @rr_partition_id = nil
       @rr_threshold_value = nil
       @rr_debug_cnt = 0
       @rr_debug_metric = nil
+      @producers = nil
+      @producers_mutex = nil
+      @shared_producer = nil
+
+      @writing_threads_mutex = Mutex.new
+      @writing_threads = Set.new
     end
 
     def refresh_client(raise_error = true)
       begin
         logger = @get_kafka_client_log ? log : nil
         if @scram_mechanism != nil && @username != nil && @password != nil
-          @kafka = Kafka.new(seed_brokers: @seed_brokers, client_id: @client_id, logger: logger, connect_timeout: @connect_timeout, socket_timeout: @socket_timeout, ssl_ca_cert: read_ssl_file(@ssl_ca_cert),
+          @kafka = Kafka.new(seed_brokers: @seed_brokers, client_id: @client_id, logger: logger, connect_timeout: @connect_timeout, socket_timeout: @socket_timeout, ssl_ca_cert_file_path: @ssl_ca_cert,
                              ssl_client_cert: read_ssl_file(@ssl_client_cert), ssl_client_cert_key: read_ssl_file(@ssl_client_cert_key), ssl_client_cert_chain: read_ssl_file(@ssl_client_cert_chain),
                              ssl_ca_certs_from_system: @ssl_ca_certs_from_system, sasl_scram_username: @username, sasl_scram_password: @password,
-                             sasl_scram_mechanism: @scram_mechanism, sasl_over_ssl: @sasl_over_ssl, ssl_verify_hostname: @ssl_verify_hostname)
+                             sasl_scram_mechanism: @scram_mechanism, sasl_over_ssl: @sasl_over_ssl, ssl_verify_hostname: @ssl_verify_hostname, resolve_seed_brokers: @resolve_seed_brokers,
+                             partitioner: Kafka::Partitioner.new(hash_function: @partitioner_hash_function))
         elsif @username != nil && @password != nil
-          @kafka = Kafka.new(seed_brokers: @seed_brokers, client_id: @client_id, logger: logger, connect_timeout: @connect_timeout, socket_timeout: @socket_timeout, ssl_ca_cert: read_ssl_file(@ssl_ca_cert),
+          @kafka = Kafka.new(seed_brokers: @seed_brokers, client_id: @client_id, logger: logger, connect_timeout: @connect_timeout, socket_timeout: @socket_timeout, ssl_ca_cert_file_path: @ssl_ca_cert,
                              ssl_client_cert: read_ssl_file(@ssl_client_cert), ssl_client_cert_key: read_ssl_file(@ssl_client_cert_key), ssl_client_cert_chain: read_ssl_file(@ssl_client_cert_chain),
                              ssl_ca_certs_from_system: @ssl_ca_certs_from_system, sasl_plain_username: @username, sasl_plain_password: @password, sasl_over_ssl: @sasl_over_ssl,
-                             ssl_verify_hostname: @ssl_verify_hostname)
+                             ssl_verify_hostname: @ssl_verify_hostname, resolve_seed_brokers: @resolve_seed_brokers,
+                             partitioner: Kafka::Partitioner.new(hash_function: @partitioner_hash_function))
         else
-          @kafka = Kafka.new(seed_brokers: @seed_brokers, client_id: @client_id, logger: logger, connect_timeout: @connect_timeout, socket_timeout: @socket_timeout, ssl_ca_cert: read_ssl_file(@ssl_ca_cert),
+          @kafka = Kafka.new(seed_brokers: @seed_brokers, client_id: @client_id, logger: logger, connect_timeout: @connect_timeout, socket_timeout: @socket_timeout, ssl_ca_cert_file_path: @ssl_ca_cert,
                              ssl_client_cert: read_ssl_file(@ssl_client_cert), ssl_client_cert_key: read_ssl_file(@ssl_client_cert_key), ssl_client_cert_chain: read_ssl_file(@ssl_client_cert_chain),
                              ssl_ca_certs_from_system: @ssl_ca_certs_from_system, sasl_gssapi_principal: @principal, sasl_gssapi_keytab: @keytab, sasl_over_ssl: @sasl_over_ssl,
-                             ssl_verify_hostname: @ssl_verify_hostname)
+                             ssl_verify_hostname: @ssl_verify_hostname, resolve_seed_brokers: @resolve_seed_brokers,
+                             partitioner: Kafka::Partitioner.new(hash_function: @partitioner_hash_function))
         end
         log.info "initialized kafka producer: #{@client_id}"
       rescue Exception => e
@@ -144,7 +166,7 @@ DESC
         @seed_brokers = @brokers
         log.info "brokers has been set: #{@seed_brokers}"
       else
-        raise Fluent::Config, 'No brokers specified. Need one broker at least.'
+        raise Fluent::ConfigError, 'No brokers specified. Need one broker at least.'
       end
 
       formatter_conf = conf.elements('format').first
@@ -188,15 +210,33 @@ DESC
       @headers_from_record.each do |key, value|
         @headers_from_record_accessors[key] = record_accessor_create(value)
       end
+
+      @exclude_field_accessors = @exclude_fields.map do |field|
+        record_accessor_create(field)
+      end
+
+      @record_field_accessor = nil
+      @record_field_accessor = record_accessor_create(@record_key) unless @record_key.nil?
     end
 
     def multi_workers_ready?
       true
     end
 
+    def create_producer
+      @kafka.custom_producer(**@producer_opts)
+    end
+
     def start
       super
       refresh_client
+
+      if @share_producer
+        @shared_producer = create_producer
+      else
+        @producers = {}
+        @producers_mutex = Mutex.new
+      end
     end
 
     def close
@@ -207,6 +247,56 @@ DESC
     def terminate
       super
       @kafka = nil
+    end
+
+    def wait_writing_threads
+      done = false
+      until done do
+        @writing_threads_mutex.synchronize do
+          done = true if @writing_threads.empty?
+        end
+        sleep(1) unless done
+      end
+    end
+
+    def shutdown
+      super
+      wait_writing_threads
+      shutdown_producers
+    end
+
+    def shutdown_producers
+      if @share_producer
+        @shared_producer.shutdown
+        @shared_producer = nil
+      else
+        @producers_mutex.synchronize {
+          shutdown_threads = @producers.map { |key, producer|
+            th = Thread.new {
+              producer.shutdown
+            }
+            th.abort_on_exception = true
+            th
+          }
+          shutdown_threads.each { |th| th.join }
+          @producers = {}
+        }
+      end
+    end
+
+    def get_producer
+      if @share_producer
+        @shared_producer
+      else
+        @producers_mutex.synchronize {
+          producer = @producers[Thread.current.object_id]
+          unless producer
+            producer = create_producer
+            @producers[Thread.current.object_id] = producer
+          end
+          producer
+        }
+      end
     end
 
     def setup_formatter(conf)
@@ -232,17 +322,22 @@ DESC
 
     # TODO: optimize write performance
     def write(chunk)
+      @writing_threads_mutex.synchronize { @writing_threads.add(Thread.current) }
+
       tag = chunk.metadata.tag
-      topic =  (chunk.metadata.variables && chunk.metadata.variables[@topic_key_sym]) || @default_topic || tag
+      topic = if @topic
+                extract_placeholders(@topic, chunk)
+              else
+                (chunk.metadata.variables && chunk.metadata.variables[@topic_key_sym]) || @default_topic || tag
+              end
 
       messages = 0
-      record_buf = nil
 
       base_headers = @headers
       mutate_headers = !@headers_from_record_accessors.empty?
 
       begin
-        producer = @kafka.topic_producer(topic, @producer_opts)
+        producer = get_producer
         chunk.msgpack_each { |time, record|
           begin
             record = inject_values_to_record(tag, time, record)
@@ -265,10 +360,18 @@ DESC
               headers = base_headers
             end
 
+            unless @exclude_fields.empty?
+              @exclude_field_accessors.each do |exclude_field_accessor|
+                exclude_field_accessor.delete(record)
+              end
+            end
+
+            record = @record_field_accessor.call(record) unless @record_field_accessor.nil?
             record_buf = @formatter_proc.call(tag, time, record)
             record_buf_bytes = record_buf.bytesize
             if @max_send_limit_bytes && record_buf_bytes > @max_send_limit_bytes
-              log.warn "record size exceeds max_send_limit_bytes. Skip event:", :time => time, :record => record
+              log.warn "record size exceeds max_send_limit_bytes. Skip event:", :time => time, :record_size => record_buf_bytes
+              log.debug "Skipped event:", :record => record
               next
             end
           rescue StandardError => e
@@ -281,16 +384,24 @@ DESC
           messages += 1
 
           producer.produce(record_buf, key: message_key, partition_key: partition_key, partition: partition, headers: headers,
-                           create_time: @use_event_time ? Time.at(time) : Time.now)
+                           create_time: @use_event_time ? Time.at(time) : Time.now, topic: topic)
         }
 
         if messages > 0
           log.debug { "#{messages} messages send." }
-          producer.deliver_messages
+          if @discard_kafka_delivery_failed
+            begin
+              producer.deliver_messages
+            rescue Kafka::DeliveryFailed => e
+              log.warn "DeliveryFailed occurred. Discard broken event:", :error => e.to_s, :error_class => e.class.to_s, :tag => tag
+              producer.clear_buffer
+            end
+          else
+            producer.deliver_messages
+          end
         end
       rescue Kafka::UnknownTopicOrPartition
         if @use_default_for_unknown_topic && topic != @default_topic
-          producer.shutdown if producer
           log.warn "'#{topic}' topic not found. Retry with '#{default_topic}' topic"
           topic = @default_topic
           retry
@@ -310,7 +421,7 @@ DESC
       # Raise exception to retry sendind messages
       raise e unless ignore
     ensure
-      producer.shutdown if producer
+      @writing_threads_mutex.synchronize { @writing_threads.delete(Thread.current) }
     end
 
     def round_robin_next(record)
