@@ -95,7 +95,6 @@ Setup round-robin partitioning type.
 Can be 'count' what means record count in threshold or 'size' what means message size in threshold
 DESC
     config_param :rr_partitioning_threshold, :integer, :default => nil
-    config_param :rr_partitioning_partitions, :string, :default => nil
     config_param :rr_partitioning_debug, :integer, :default => 0
     config_param :rr_partitioning_metricdump, :integer, :default => 1000
 
@@ -130,7 +129,14 @@ DESC
     def refresh_client(raise_error = true)
       begin
         logger = @get_kafka_client_log ? log : nil
-        if @scram_mechanism != nil && @username != nil && @password != nil
+        if @rr_partitioning
+          partitioner = -> (partition_count, message) { round_robin_next(partition_count, message) }
+          @kafka = Kafka.new(seed_brokers: @seed_brokers, client_id: @client_id, logger: logger, connect_timeout: @connect_timeout, socket_timeout: @socket_timeout, ssl_ca_cert_file_path: @ssl_ca_cert,
+                             ssl_client_cert: read_ssl_file(@ssl_client_cert), ssl_client_cert_key: read_ssl_file(@ssl_client_cert_key), ssl_client_cert_chain: read_ssl_file(@ssl_client_cert_chain),
+                             ssl_ca_certs_from_system: @ssl_ca_certs_from_system, sasl_scram_username: @username, sasl_scram_password: @password,
+                             sasl_scram_mechanism: @scram_mechanism, sasl_over_ssl: @sasl_over_ssl, ssl_verify_hostname: @ssl_verify_hostname, resolve_seed_brokers: @resolve_seed_brokers,
+                             partitioner: partitioner)
+        elsif @scram_mechanism != nil && @username != nil && @password != nil
           @kafka = Kafka.new(seed_brokers: @seed_brokers, client_id: @client_id, logger: logger, connect_timeout: @connect_timeout, socket_timeout: @socket_timeout, ssl_ca_cert_file_path: @ssl_ca_cert,
                              ssl_client_cert: read_ssl_file(@ssl_client_cert), ssl_client_cert_key: read_ssl_file(@ssl_client_cert_key), ssl_client_cert_chain: read_ssl_file(@ssl_client_cert_chain),
                              ssl_ca_certs_from_system: @ssl_ca_certs_from_system, sasl_scram_username: @username, sasl_scram_password: @password,
@@ -343,12 +349,7 @@ DESC
             record = inject_values_to_record(tag, time, record)
             record.delete(@topic_key) if @exclude_topic_key
             partition_key = (@exclude_partition_key ? record.delete(@partition_key_key) : record[@partition_key_key]) || @default_partition_key
-#            partition = (@exclude_partition ? record.delete(@partition_key) : record[@partition_key]) || @default_partition
-            if @rr_partitioning
-              partition = round_robin_next(record)
-            else
-              partition = (@exclude_partition ? record.delete(@partition_key) : record[@partition_key]) || @default_partition
-            end
+            partition = (@exclude_partition ? record.delete(@partition_key) : record[@partition_key]) || @default_partition
             message_key = (@exclude_message_key ? record.delete(@message_key_key) : record[@message_key_key]) || @default_message_key
 
             if mutate_headers
@@ -424,22 +425,13 @@ DESC
       @writing_threads_mutex.synchronize { @writing_threads.delete(Thread.current) }
     end
 
-    def round_robin_next(record)
+    def round_robin_next(partition_count, record)
       begin
         if @rr_partition_id.nil?
-          if @rr_partitioning_partitions.nil?
-            log.warn "kafka2 :rr_partitioning_partitions is not set!"
-            return -1 # default
-          end
-          @rr_partition_list = []
-          @rr_partitioning_partitions.split(',').each { |spid|
-            @rr_partition_list << spid.to_i
-          }
-          log.warn "kafka2 partitions: #{JSON.dump(@rr_partition_list)}"
           @rr_debug_metric = {}
-          @rr_partition_list.each { |pid|
-            @rr_debug_metric["p#{pid}"] = 0
-          }
+          for a in 1..partition_count do
+            @rr_debug_metric["p#{a-1}"] = 0
+          end
           log.warn "kafka2 debug metrics: #{JSON.dump(@rr_debug_metric)}"
           @rr_threshold_value = 0
           if @rr_partitioning_threshold.nil?
@@ -463,25 +455,26 @@ DESC
           value = 0
         end
         @rr_threshold_value += value
-        while @rr_threshold_value >= @rr_partitioning_threshold do
-          @rr_partition_id += 1
-          @rr_threshold_value -= @rr_partitioning_threshold
-          if @rr_partition_id >= @rr_partition_list.length
-            @rr_partition_id -= @rr_partition_list.length
-          end
+        if @rr_threshold_value >= @rr_partitioning_threshold
+          # increment partition by number of multiple of threshold accumulated, then reduce to proper range
+          @rr_partition_id += @rr_threshold_value / @rr_partitioning_threshold
+          @rr_partition_id = @rr_partition_id % partition_count
+
+          # reset threshold_value to remainder after removing multiple of threshold
+          @rr_threshold_value =  @rr_threshold_value % @rr_partitioning_threshold
           if @rr_partitioning_debug>1
             #log.warn "kafka2 switch partition to #{@rr_partition_list[@rr_partition_id]}"
           end
         end
         if @rr_partitioning_debug>0
-          @rr_debug_metric["p#{@rr_partition_list[@rr_partition_id]}"] += 1
+          @rr_debug_metric["p#{@rr_partition_id}"] += 1
           @rr_debug_cnt += 1
           if @rr_debug_cnt >= @rr_partitioning_metricdump
             @rr_debug_cnt = 0
             log.warn "kafka2 metrics: #{JSON.dump(@rr_debug_metric)}"
           end
         end
-        @rr_partition_list[@rr_partition_id]
+        @rr_partition_id
       rescue StandardError => e
         log.warn "Kafka error", :error => e.to_s, :error_class => e.class.to_s, :stack => e.backtrace
         log.warn_backtrace backtrace=e.backtrace
